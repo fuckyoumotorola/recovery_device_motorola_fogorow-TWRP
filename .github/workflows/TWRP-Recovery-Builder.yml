@@ -29,7 +29,7 @@ jobs:
       BUILD_TARGET: vendorboot
       RECOVERY_TYPE: vendor_boot
       CCACHE_DIR: /tmp/ccache
-      MANIFEST_URL: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+      MANIFEST_URL: https://github.com/fuckyoutwrp/platform_manifest_twrp_aosp.git
       MANIFEST_BRANCH: twrp-12.1
       CCACHE_TEMPDIR: /tmp/ccache-tmp
 
