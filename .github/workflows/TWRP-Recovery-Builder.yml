@@ -1,0 +1,882 @@
+name: TWRP - Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ANDROID_VERSION:
+        description: "Android version"
+        required: true
+        default: "15"
+        type: choice
+        options:
+          - "14"
+          - "15"
+          - "16"
+
+      BUILD_FINGERPRINT:
+        description: "Build fingerprint"
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build TWRP by ${{ github.actor }}
+    runs-on: ubuntu-22.04
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DEVICE_PATH: device/motorola/fogorow
+      DEVICE_NAME: fogorow
+      BUILD_TARGET: vendorboot
+      RECOVERY_TYPE: vendor_boot
+      CCACHE_DIR: /tmp/ccache
+      MANIFEST_URL: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+      MANIFEST_BRANCH: twrp-12.1
+      CCACHE_TEMPDIR: /tmp/ccache-tmp
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Check runner specs
+      run: |
+        echo "Runner name: $RUNNER_NAME"
+        echo "Runner OS: $RUNNER_OS"
+        nproc
+        free -h
+        df -h
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Prepare ccache directories
+      run: |
+        sudo mkdir -p "${CCACHE_DIR}"
+        sudo mkdir -p "${CCACHE_TEMPDIR}"
+
+        sudo chown -R "$(id -u):$(id -g)" "${CCACHE_DIR}"
+        sudo chown -R "$(id -u):$(id -g)" "${CCACHE_TEMPDIR}"
+
+        chmod -R u+rwX "${CCACHE_DIR}"
+        chmod -R u+rwX "${CCACHE_TEMPDIR}"
+
+        echo "CCACHE_DIR=${CCACHE_DIR}"
+        echo "CCACHE_TEMPDIR=${CCACHE_TEMPDIR}"
+
+        touch "${CCACHE_DIR}/write-test"
+        rm "${CCACHE_DIR}/write-test"
+
+        touch "${CCACHE_TEMPDIR}/write-test"
+        rm "${CCACHE_TEMPDIR}/write-test"
+
+    - name: Set up ccache
+      uses: fuckyouhubgit/ccache-action@v1.2
+      with:
+        key: twrp-${{ env.MANIFEST_BRANCH }}-${{ env.DEVICE_NAME }}
+        restore-keys: |
+          twrp-${{ env.MANIFEST_BRANCH }}-${{ env.DEVICE_NAME }}
+          twrp-${{ env.MANIFEST_BRANCH }}
+        max-size: 10G
+        append-timestamp: true
+        verbose: 1
+
+    - name: Swap Space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 8
+
+    - name: Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        sudo cp ~/bin/repo /usr/local/bin/repo
+
+    - name: Restore TWRP source cache
+      id: twrp-source-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ github.workspace }}/TWRP/.repo
+        key: twrp-source-${{ runner.os }}-${{ env.MANIFEST_BRANCH }}
+
+    - name: Set-up Manifest & Sync
+      shell: bash
+      run: |
+        set -e
+
+        ROOT_DIR="${GITHUB_WORKSPACE}/TWRP"
+        mkdir -p "${ROOT_DIR}"
+
+        git config --global user.name "Samuel Kendall"
+        git config --global user.email "kinguser981@gmail.com"
+
+        cd "${ROOT_DIR}"
+
+        repo init -u ${{ env.MANIFEST_URL }} -b ${{ env.MANIFEST_BRANCH }} -c --no-tags --depth=1 --git-lfs
+        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+    - name: Clone Device Tree
+      run: |
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        git clone "https://github.com/${{ github.repository }}" \
+          -b "${{ github.ref_name }}" \
+          "./${{ env.DEVICE_PATH }}"
+
+        cd "${{ env.DEVICE_PATH }}"
+
+        echo "COMMIT_ID=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+        echo "DEVICE_TREE_URL=https://github.com/${{ github.repository }}" >> "$GITHUB_ENV"
+        echo "DEVICE_TREE_BRANCH=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+    - name: Download and max-compress LP tools
+      shell: bash
+      run: |
+        set -e
+
+        sudo apt-get update
+        sudo apt-get install -y upx-ucl binutils-aarch64-linux-gnu
+
+        LP_TOOLS_DIR="${GITHUB_WORKSPACE}/TWRP/device/motorola/fogorow/recovery/root/sbin"
+        LP_TOOLS_REPO="https://raw.githubusercontent.com/fuckyouandroid/android-partition-tools_prebuilt_binaries-armv8a/main"
+
+        mkdir -p "$LP_TOOLS_DIR"
+
+        for bin in lpadd lpdump lpflash lpmake lpunpack; do
+          echo "Downloading $bin..."
+          curl -L --fail -o "$LP_TOOLS_DIR/$bin" "$LP_TOOLS_REPO/$bin"
+          chmod 755 "$LP_TOOLS_DIR/$bin"
+
+          echo "Original size:"
+          ls -lh "$LP_TOOLS_DIR/$bin"
+
+          echo "Stripping $bin..."
+          aarch64-linux-gnu-strip --strip-all "$LP_TOOLS_DIR/$bin" || true
+
+          echo "Compressing $bin with UPX max..."
+          upx --ultra-brute --lzma "$LP_TOOLS_DIR/$bin" || upx --best --lzma "$LP_TOOLS_DIR/$bin" || true
+
+          chmod 755 "$LP_TOOLS_DIR/$bin"
+
+          echo "Final size:"
+          ls -lh "$LP_TOOLS_DIR/$bin"
+        done
+
+        echo "Final LP tools:"
+        ls -lh "$LP_TOOLS_DIR"/lp*
+
+    - name: Fill PLATFORM_VERSION in BoardConfig.mk
+      shell: bash
+      env:
+        ANDROID_VERSION: ${{ github.event.inputs.ANDROID_VERSION }}
+      run: |
+        set -e
+
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        BOARD_CONFIG="${{ env.DEVICE_PATH }}/BoardConfig.mk"
+
+        if [ ! -f "$BOARD_CONFIG" ]; then
+          echo "::error::BoardConfig.mk not found: $BOARD_CONFIG"
+          exit 1
+        fi
+
+        sed -i "s/^PLATFORM_VERSION[[:space:]]*:=.*/PLATFORM_VERSION := ${ANDROID_VERSION}/" "$BOARD_CONFIG"
+
+        if ! grep -q "^PLATFORM_VERSION := ${ANDROID_VERSION}$" "$BOARD_CONFIG"; then
+          echo "::error::Failed to set PLATFORM_VERSION"
+          grep -n "PLATFORM_VERSION" "$BOARD_CONFIG" || true
+          exit 1
+        fi
+
+        echo "=== PLATFORM_VERSION ==="
+        grep -n "^PLATFORM_VERSION" "$BOARD_CONFIG"
+
+    - name: Fill fingerprint props in system.prop
+      shell: bash
+      env:
+        BUILD_FINGERPRINT: ${{ github.event.inputs.BUILD_FINGERPRINT }}
+      run: |
+        set -e
+
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        PROP_FILE="${{ env.DEVICE_PATH }}/system.prop"
+
+        mkdir -p "$(dirname "$PROP_FILE")"
+        touch "$PROP_FILE"
+
+        sed -i '/^ro\.build\.fingerprint=/d' "$PROP_FILE"
+        sed -i '/^ro\.vendor\.build\.fingerprint=/d' "$PROP_FILE"
+
+        {
+          echo ""
+          echo "# Fingerprint / Build"
+          echo "ro.build.fingerprint=${BUILD_FINGERPRINT}"
+          echo "ro.vendor.build.fingerprint=${BUILD_FINGERPRINT}"
+        } >> "$PROP_FILE"
+
+        echo "=== Final system.prop ==="
+        cat "$PROP_FILE"
+
+    - name: Patch vibrator
+      shell: bash
+      run: |
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+
+        path = Path("bootable/recovery/minuitwrp/events.cpp")
+
+        if not path.is_file():
+            raise SystemExit(f"No existe el archivo: {path}")
+
+        source = path.read_text(encoding="utf-8")
+
+        vibrator_path = (
+            "/sys/devices/platform/regulator_vibrator/"
+            "leds/vibrator/brightness"
+        )
+
+        source, path_replacements = re.subn(
+            r'#define\s+VIBRATOR_TIMEOUT_FILE\s+"[^"]+"',
+            f'#define VIBRATOR_TIMEOUT_FILE "{vibrator_path}"',
+            source,
+            count=1,
+        )
+
+        if path_replacements == 0:
+            raise SystemExit(
+                "No se encontró la definición VIBRATOR_TIMEOUT_FILE"
+            )
+
+        signature = re.search(
+            r'\bint\s+vibrate\s*\(\s*int\s+timeout_ms\s*\)\s*\{',
+            source,
+        )
+
+        if not signature:
+            raise SystemExit(
+                "No se encontró int vibrate(int timeout_ms) en events.cpp"
+            )
+
+        opening_brace = source.find("{", signature.start())
+
+        depth = 0
+        closing_brace = None
+
+        for index in range(opening_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+
+                if depth == 0:
+                    closing_brace = index + 1
+                    break
+
+        if closing_brace is None:
+            raise SystemExit(
+                "No se pudo determinar el final de la función vibrate"
+            )
+
+        new_function = r'''int vibrate(int timeout_ms)
+        {
+            int fd;
+
+            if (timeout_ms <= 0)
+                return -1;
+
+            if (timeout_ms > 1000)
+                timeout_ms = 1000;
+
+            fd = open(VIBRATOR_TIMEOUT_FILE, O_WRONLY | O_CLOEXEC);
+            if (fd < 0)
+                return -1;
+
+            if (write(fd, "255\n", 4) < 0) {
+                close(fd);
+                return -1;
+            }
+
+            close(fd);
+
+            usleep((useconds_t)timeout_ms * 1000);
+
+            fd = open(VIBRATOR_TIMEOUT_FILE, O_WRONLY | O_CLOEXEC);
+            if (fd < 0)
+                return -1;
+
+            if (write(fd, "0\n", 2) < 0) {
+                close(fd);
+                return -1;
+            }
+
+            close(fd);
+            return 0;
+        }'''
+
+        source = (
+            source[:signature.start()]
+            + new_function
+            + source[closing_brace:]
+        )
+
+        path.write_text(source, encoding="utf-8")
+
+        print("Parche de vibración aplicado correctamente")
+        print(f"Archivo: {path}")
+        print(f"Ruta: {vibrator_path}")
+        PY
+
+        echo "=== Función parcheada ==="
+        grep -n -A45 -B5 \
+          "int vibrate" \
+          bootable/recovery/minuitwrp/events.cpp
+
+    - name: Patch flashlight strobe toggler
+      shell: bash
+      run: |
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+
+        path = Path("bootable/recovery/gui/action.cpp")
+
+        if not path.is_file():
+            raise SystemExit(f"No existe: {path}")
+
+        source = path.read_text(encoding="utf-8", errors="ignore")
+
+        if "FOGOROW_FLASHLIGHT_STROBE_PATCH" in source:
+            raise SystemExit("El parche viejo ya estaba aplicado. Limpiá el source cache o cambia la key del cache.")
+
+        helper = r'''
+        #ifndef FOGOROW_FLASHLIGHT_STROBE_PATCH
+        #define FOGOROW_FLASHLIGHT_STROBE_PATCH
+
+        #include <atomic>
+        #include <pthread.h>
+        #include <fcntl.h>
+        #include <unistd.h>
+        #include <string.h>
+        #include <time.h>
+
+        static const char* FOGOROW_FLASHLIGHT_STROBE_PATH =
+            "/sys/devices/virtual/flashlight_core/flashlight/flashlight_strobe";
+
+        static std::atomic_bool fogorow_flashlight_running(false);
+        static pthread_t fogorow_flashlight_thread;
+        static bool fogorow_flashlight_thread_created = false;
+        static long long fogorow_flashlight_last_toggle_ms = 0;
+
+        static long long fogorow_now_ms()
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            return ((long long)ts.tv_sec * 1000LL) + (ts.tv_nsec / 1000000LL);
+        }
+
+        static void fogorow_flashlight_write(const char* value)
+        {
+            int fd = open(FOGOROW_FLASHLIGHT_STROBE_PATH, O_WRONLY | O_CLOEXEC);
+            if (fd < 0)
+                return;
+
+            write(fd, value, strlen(value));
+            close(fd);
+        }
+
+        static void fogorow_flashlight_off()
+        {
+            fogorow_flashlight_write("0 0 0 0 0");
+        }
+
+        static void* fogorow_flashlight_loop(void*)
+        {
+            while (fogorow_flashlight_running.load()) {
+                fogorow_flashlight_write("0 0 0 1 3000");
+                usleep(0);
+            }
+
+            fogorow_flashlight_off();
+            return nullptr;
+        }
+
+        static int fogorow_flashlight_toggle()
+        {
+            long long now = fogorow_now_ms();
+
+            if (now - fogorow_flashlight_last_toggle_ms < 500)
+                return 0;
+
+            fogorow_flashlight_last_toggle_ms = now;
+
+            int fd = open(FOGOROW_FLASHLIGHT_STROBE_PATH, O_WRONLY | O_CLOEXEC);
+            if (fd < 0)
+                return -1;
+
+            close(fd);
+
+            if (fogorow_flashlight_running.load()) {
+                fogorow_flashlight_running.store(false);
+
+                if (fogorow_flashlight_thread_created) {
+                    pthread_join(fogorow_flashlight_thread, nullptr);
+                    fogorow_flashlight_thread_created = false;
+                }
+
+                fogorow_flashlight_off();
+                return 0;
+            }
+
+            fogorow_flashlight_running.store(true);
+
+            if (pthread_create(&fogorow_flashlight_thread, nullptr, fogorow_flashlight_loop, nullptr) != 0) {
+                fogorow_flashlight_running.store(false);
+                fogorow_flashlight_off();
+                return -1;
+            }
+
+            fogorow_flashlight_thread_created = true;
+            return 0;
+        }
+
+        #endif
+        '''
+
+        includes = list(re.finditer(r'^\s*#include[^\n]*$', source, flags=re.MULTILINE))
+        if not includes:
+            raise SystemExit("No encontré includes en action.cpp")
+
+        source = source[:includes[-1].end()] + "\n" + helper + source[includes[-1].end():]
+
+        signature = re.search(
+            r'int\s+GUIAction::flashlightImpl\s*\(\s*std::string\s+arg\s+__unused\s*\)\s*\{',
+            source
+        )
+
+        if not signature:
+            raise SystemExit("No encontré GUIAction::flashlightImpl(std::string arg __unused)")
+
+        opening = source.find("{", signature.start())
+        depth = 0
+        closing = None
+
+        for i in range(opening, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    closing = i + 1
+                    break
+
+        if closing is None:
+            raise SystemExit("No pude cerrar la función flashlightImpl")
+
+        new_func = r'''int GUIAction::flashlightImpl(std::string arg __unused)
+        {
+            int ret = fogorow_flashlight_toggle();
+
+            if (ret < 0) {
+                gui_msg(Msg(msg::kError, "flashlight_file_not_found=Flashlight file not found!"));
+            }
+
+            return 0;
+        }'''
+
+        source = source[:signature.start()] + new_func + source[closing:]
+        path.write_text(source, encoding="utf-8")
+
+        print("Parche flashlight corregido aplicado")
+        print("ON:  0 0 0 1 3000")
+        print("OFF: 0 0 0 0 0")
+        PY
+
+        grep -n -A80 -B10 "FOGOROW_FLASHLIGHT_STROBE_PATCH" bootable/recovery/gui/action.cpp
+        grep -n -A20 -B5 "GUIAction::flashlightImpl" bootable/recovery/gui/action.cpp
+
+    - name: Patch SELinux permissive
+      shell: bash
+      run: |
+        set -e
+
+        ROOT="${GITHUB_WORKSPACE}/TWRP"
+
+        if [ ! -d "$ROOT/bootable/recovery" ]; then
+          echo "ERROR: bootable/recovery not found"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          find "${GITHUB_WORKSPACE}" -maxdepth 4 -type d | sort | head -200
+          exit 1
+        fi
+
+        cd "$ROOT"
+        echo "Using source root: $ROOT"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+        import textwrap
+
+        MARKER = "FOGOROW_FORCE_SELINUX_PERMISSIVE_FOREVER"
+
+        candidates = [
+            Path("bootable/recovery/twrp.cpp"),
+            Path("bootable/recovery/recovery.cpp"),
+        ]
+
+        helper = textwrap.dedent("""
+        #ifndef FOGOROW_FORCE_SELINUX_PERMISSIVE_FOREVER
+        #define FOGOROW_FORCE_SELINUX_PERMISSIVE_FOREVER
+
+        #include <fcntl.h>
+        #include <unistd.h>
+        #include <pthread.h>
+        #include <sys/stat.h>
+        #include <sys/types.h>
+
+        static void fogorow_write_selinux_permissive()
+        {
+            int fd = open("/sys/fs/selinux/enforce", O_WRONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                write(fd, "0", 1);
+                close(fd);
+            }
+        }
+
+        static void* fogorow_selinux_permissive_watchdog(void*)
+        {
+            while (1) {
+                fogorow_write_selinux_permissive();
+                usleep(100000);
+            }
+
+            return nullptr;
+        }
+
+        static void fogorow_force_selinux_permissive_forever()
+        {
+            pthread_t thread;
+
+            fogorow_write_selinux_permissive();
+
+            if (pthread_create(&thread, nullptr, fogorow_selinux_permissive_watchdog, nullptr) == 0) {
+                pthread_detach(thread);
+            }
+        }
+
+        #endif
+        """).strip() + "\n"
+
+        patched_any = False
+
+        for path in candidates:
+            if not path.is_file():
+                print(f"Skip missing: {path}")
+                continue
+
+            source = path.read_text(encoding="utf-8", errors="ignore")
+
+            if MARKER in source:
+                print(f"Already patched: {path}")
+                patched_any = True
+                break
+
+            main_match = re.search(
+                r'\bint\s+main\s*\([^)]*\)\s*\{',
+                source,
+                flags=re.MULTILINE | re.DOTALL,
+            )
+
+            if not main_match:
+                print(f"No main() found in: {path}")
+                continue
+
+            insert_pos = main_match.end()
+
+            source = (
+                helper
+                + "\n"
+                + source[:insert_pos]
+                + "\n    fogorow_force_selinux_permissive_forever();\n"
+                + source[insert_pos:]
+            )
+
+            path.write_text(source, encoding="utf-8")
+            print(f"Patched: {path}")
+            patched_any = True
+            break
+
+        if not patched_any:
+            raise SystemExit("Couldnt patch twrp.cpp ni recovery.cpp")
+        PY
+
+        echo "=== SELinux permissive patch check ==="
+        grep -Rsn "FOGOROW_FORCE_SELINUX_PERMISSIVE_FOREVER" bootable/recovery || true
+        grep -Rsn "fogorow_force_selinux_permissive_forever" bootable/recovery || true
+
+    - name: Patch product_a bind mount
+      shell: bash
+      run: |
+        set -e
+
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+        import textwrap
+
+        MARKER = "FOGOROW_PRODUCT_A_BIND_MOUNT"
+
+        candidates = [
+            Path("bootable/recovery/partition.cpp"),
+            Path("bootable/recovery/twrp.cpp"),
+            Path("bootable/recovery/recovery.cpp"),
+        ]
+
+        helper = textwrap.dedent(r'''
+        #ifndef FOGOROW_PRODUCT_A_BIND_MOUNT
+        #define FOGOROW_PRODUCT_A_BIND_MOUNT
+
+        #include <sys/mount.h>
+        #include <sys/stat.h>
+        #include <unistd.h>
+        #include <string>
+
+        static bool fogorow_bind_product_a(const std::string& mount_point)
+        {
+            if (mount_point != "/product_a")
+                return false;
+
+            mkdir("/product_a", 0755);
+
+            struct stat st;
+            if (stat("/system_a/product", &st) != 0 || !S_ISDIR(st.st_mode))
+                return false;
+
+            umount("/product_a");
+
+            return mount("/system_a/product", "/product_a", nullptr, MS_BIND, nullptr) == 0;
+        }
+
+        #endif
+        ''').strip() + "\n"
+
+        patched = False
+
+        for path in candidates:
+            if not path.is_file():
+                print(f"Skip missing: {path}")
+                continue
+
+            source = path.read_text(encoding="utf-8", errors="ignore")
+
+            if MARKER in source:
+                print(f"Already patched: {path}")
+                patched = True
+                break
+
+            match = re.search(
+                r'bool\s+TWPartition::Mount\s*\(\s*bool\s+Display_Error\s*\)\s*\{',
+                source
+            )
+
+            if not match:
+                print(f"No TWPartition::Mount(bool Display_Error) in {path}")
+                continue
+
+            insert_pos = match.end()
+
+            source = (
+                helper
+                + "\n"
+                + source[:insert_pos]
+                + "\n\tif (fogorow_bind_product_a(Mount_Point))\n\t\treturn true;\n"
+                + source[insert_pos:]
+            )
+
+            path.write_text(source, encoding="utf-8")
+            print(f"Patched: {path}")
+            patched = True
+            break
+
+        if not patched:
+            raise SystemExit("Could not patch TWPartition::Mount(bool Display_Error)")
+        PY
+
+        echo "=== product_a bind patch check ==="
+        grep -Rsn "FOGOROW_PRODUCT_A_BIND_MOUNT" bootable/recovery || true
+        grep -Rsn "fogorow_bind_product_a" bootable/recovery || true
+
+    - name: Patch decrypted data unmount bug
+      shell: bash
+      run: |
+        set -e
+
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        import textwrap
+
+        MARKER = "FOGOROW_BLOCK_DECRYPTED_DATA_UNMOUNT"
+
+        path = Path("bootable/recovery/partitionmanager.cpp")
+        if not path.exists():
+            raise SystemExit("partitionmanager.cpp not found")
+
+        text = path.read_text()
+
+        if MARKER in text:
+            print("Patch already applied")
+            raise SystemExit(0)
+
+        start = text.find("int TWPartitionManager::UnMount_By_Path")
+        end = text.find("int TWPartitionManager::Is_Mounted_By_Path", start)
+
+        if start == -1 or end == -1:
+            raise SystemExit("Could not find UnMount_By_Path block")
+
+        block = text[start:end]
+
+        needle = "string Local_Path = TWFunc::Get_Root_Path(Path);"
+
+        inject = textwrap.dedent(r'''
+        string Local_Path = TWFunc::Get_Root_Path(Path);
+
+        #ifdef TW_INCLUDE_FBE
+        	// FOGOROW_BLOCK_DECRYPTED_DATA_UNMOUNT
+        	// On FBE devices, unmounting /data drops installed fscrypt keys.
+        	// TWRP/OrangeFox may later remount /data without re-running user CE unlock,
+        	// causing /data/media/0 to appear encrypted again.
+        	if (Local_Path == "/data" &&
+        			DataManager::GetIntValue(TW_IS_FBE) &&
+        			DataManager::GetIntValue("tw_all_users_decrypted") == 1) {
+        		LOGINFO("FOGOROW: refusing to unmount decrypted /data to preserve fscrypt keys\n");
+        		return true;
+        	}
+        #endif
+        ''').strip()
+
+        if needle not in block:
+            raise SystemExit("Could not find Local_Path line inside UnMount_By_Path")
+
+        block = block.replace(needle, inject, 1)
+        text = text[:start] + block + text[end:]
+
+        path.write_text(text)
+        print("Patched partitionmanager.cpp")
+        PY
+
+    - name: Building TWRP
+      shell: bash
+      run: |
+        cd "${GITHUB_WORKSPACE}/TWRP"
+
+        set +e
+        source build/envsetup.sh
+        ENVSETUP_STATUS=$?
+        set -e
+
+        echo "envsetup exit status: ${ENVSETUP_STATUS}"
+
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export USE_CCACHE=1
+        export CCACHE_EXEC="$(command -v ccache)"
+
+        export CCACHE_DIR="/tmp/ccache"
+        export CCACHE_TEMPDIR="/tmp/ccache-tmp"
+
+        export CCACHE_BASEDIR="${GITHUB_WORKSPACE}"
+        export CCACHE_NOHASHDIR=true
+        export CCACHE_COMPILERCHECK=content
+        export CCACHE_SLOPPINESS="time_macros,include_file_mtime,include_file_ctime"
+
+        mkdir -p "${CCACHE_DIR}"
+        mkdir -p "${CCACHE_TEMPDIR}"
+
+        chmod -R u+rwX "${CCACHE_DIR}"
+        chmod -R u+rwX "${CCACHE_TEMPDIR}"
+
+        echo "CCACHE_EXEC=${CCACHE_EXEC}"
+        echo "CCACHE_DIR=${CCACHE_DIR}"
+        echo "CCACHE_TEMPDIR=${CCACHE_TEMPDIR}"
+
+        if [ -z "${CCACHE_EXEC}" ]; then
+          echo "::error::ccache isn't installed nor is on path"
+          exit 1
+        fi
+
+        if [ ! -w "${CCACHE_DIR}" ]; then
+          echo "::error::CCACHE_DIR isn't writeable: ${CCACHE_DIR}"
+          ls -ld "${CCACHE_DIR}"
+          exit 1
+        fi
+
+        if [ ! -w "${CCACHE_TEMPDIR}" ]; then
+          echo "::error::CCACHE_TEMPDIR isn't writeable: ${CCACHE_TEMPDIR}"
+          ls -ld "${CCACHE_TEMPDIR}"
+          exit 1
+        fi
+
+        ccache --set-config="cache_dir=${CCACHE_DIR}"
+        ccache --set-config="temporary_dir=${CCACHE_TEMPDIR}"
+        ccache --set-config="max_size=5G"
+
+        ccache --show-config
+        ccache --zero-stats
+
+        echo "Trying writing on the CCACHE directory..."
+        touch "${CCACHE_DIR}/write-test"
+        rm "${CCACHE_DIR}/write-test"
+
+        touch "${CCACHE_TEMPDIR}/write-test"
+        rm "${CCACHE_TEMPDIR}/write-test"
+
+        lunch "twrp_${{ env.DEVICE_NAME }}-eng"
+        mka -j$(nproc --all) adbd "${BUILD_TARGET}image"
+
+        ccache --show-stats
+
+    - name: Set Build Date
+      run: |
+        echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+    - name: Check if Recovery Exist
+      run: |
+        cd ${GITHUB_WORKSPACE}/TWRP
+        if [ -f out/target/product/${{ env.DEVICE_NAME }}/vendor_boot.img ]; then
+            echo "CHECK_IMG_IS_OK=true" >> $GITHUB_ENV
+            echo "FILE_PATH=${GITHUB_WORKSPACE}/TWRP/out/target/product/${{ env.DEVICE_NAME }}" >> $GITHUB_ENV
+            echo "MD5_IMG=$(md5sum out/target/product/${{ env.DEVICE_NAME }}/vendor_boot.img | cut -d ' ' -f 1)" >> $GITHUB_ENV
+        elif [ -f out/target/product/${{ env.DEVICE_NAME }}/target/product/${{ env.DEVICE_NAME }}/vendor_boot.img ]; then
+            echo "CHECK_IMG_IS_OK=true" >> $GITHUB_ENV
+            echo "FILE_PATH=${GITHUB_WORKSPACE}/TWRP/out/target/product/${{ env.DEVICE_NAME }}/target/product/${{ env.DEVICE_NAME }}" >> $GITHUB_ENV
+            echo "MD5_IMG=$(md5sum out/target/product/${{ env.DEVICE_NAME }}/target/product/${{ env.DEVICE_NAME }}/vendor_boot.img | cut -d ' ' -f 1)" >> $GITHUB_ENV
+        else
+            echo "Recovery out directory is empty or vendor_boot.img is missing."
+            exit 1
+        fi
+
+    - name: Upload to Release
+      if: env.CHECK_IMG_IS_OK == 'true'
+      uses: fuckyouhubgit/action-gh-release@v1
+      with:
+        files: |
+          ${{ env.FILE_PATH }}/${{ env.RECOVERY_TYPE }}.img
+        name: Unofficial TWRP for ${{ env.DEVICE_NAME }} Android ${{ github.event.inputs.ANDROID_VERSION }} // ${{ env.BUILD_DATE }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Android: ${{ github.event.inputs.ANDROID_VERSION }}
+          Build: ${{ env.MANIFEST_BRANCH }}
+          Build fingerprint: ${{ github.event.inputs.BUILD_FINGERPRINT }}
+          Device: [Device Tree/Branch](${{ env.DEVICE_TREE_URL }}/tree/${{ env.DEVICE_TREE_BRANCH }})
+          MD5 (img): ${{ env.MD5_IMG }}
